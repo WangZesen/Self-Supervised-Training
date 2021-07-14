@@ -2,7 +2,7 @@ import os
 import argparse
 from ezconfigparser import Config
 from data.loader import get_dataset
-from model.model import CTCClassifier
+from model.model import ExtractorNetwork, TaskSpecificNetwork
 import tensorflow as tf
 from jiwer import wer
 
@@ -25,13 +25,13 @@ def build_cfg(args):
 def calc_logit_length(cfg):
     length = (160 - cfg.kernel_size) // 2 + 1
     length = (length - cfg.kernel_size) // 2 + 1
-    # length = (length - cfg.kernel_size) // 2 + 1
     return length
 
 
 @tf.function
 def decode_step(img):
-    logit = model(img, training=False)
+    feat = extractor_net(img, training=False)
+    logit = task_net(feat, training=False)
     logit = tf.transpose(logit, perm=[1, 0, 2])
     logit = tf.roll(logit, -1, 2)
     _logit_length = tf.ones([img.shape[0]], dtype=tf.int32) * logit_len
@@ -53,8 +53,10 @@ parser.add_argument('-m', '--model_cfg', type=str, help='model configuration', r
 args = parser.parse_args()
 cfg = build_cfg(args)
 
-model = CTCClassifier(cfg)
-model.load_weights(cfg.model_dir)
+extractor_net = ExtractorNetwork(cfg)
+extractor_net.load_weights(cfg.model_dir + '.extract')
+task_net = TaskSpecificNetwork(cfg)
+task_net.load_weights(cfg.model_dir + '.task')
 
 test_ds = get_dataset(cfg, mode='test')
 

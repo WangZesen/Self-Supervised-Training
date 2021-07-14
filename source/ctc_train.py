@@ -2,7 +2,7 @@ import os
 import argparse
 from ezconfigparser import Config
 from data.loader import get_dataset
-from model.model import CTCClassifier
+from model.model import ExtractorNetwork, TaskSpecificNetwork
 import tensorflow as tf
 
 # --- hard-coded parameters --- #
@@ -22,25 +22,26 @@ def build_cfg(args):
 
 def calc_logit_length(cfg):
     length = (160 - cfg.kernel_size) // 2 + 1
-    # length = (length - cfg.kernel_size) // 2 + 1
     length = (length - cfg.kernel_size) // 2 + 1
     return length
 
 @tf.function
 def train_step(img, label, label_length):
     with tf.GradientTape() as tape:
-        logit = model(img, training=True)
+        feat = extractor_net(img, training=False)
+        logit = task_net(feat, training=False)
         _logit_length = tf.ones([img.shape[0]], dtype=tf.int32) * logit_len
         loss = loss_fn(label, logit, label_length, _logit_length, logits_time_major=False)
         loss = tf.reduce_mean(loss)
-    gradients = tape.gradient(loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+    gradients = tape.gradient(loss, extractor_net.trainable_variables + task_net.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, extractor_net.trainable_variables + task_net.trainable_variables))
     train_loss(loss)
 
 
 @tf.function
 def valid_step(img, label, label_length):
-    logit = model(img, training=False)
+    feat = extractor_net(img, training=False)
+    logit = task_net(feat, training=False)
     _logit_length = tf.ones([img.shape[0]], dtype=tf.int32) * logit_len
     loss = loss_fn(label, logit, label_length, _logit_length, logits_time_major=False)
     valid_loss(loss)
@@ -48,7 +49,8 @@ def valid_step(img, label, label_length):
 
 @tf.function
 def decode_step(img, label, label_length):
-    logit = model(img, training=False)
+    feat = extractor_net(img, training=False)
+    logit = task_net(feat, training=False)
     logit = tf.transpose(logit, perm=[1, 0, 2])
     decoded, log_probability = tf.nn.ctc_beam_search_decoder(logit, label_length, 10, 1)
     return decoded, log_probability
@@ -61,7 +63,8 @@ parser.add_argument('-m', '--model_cfg', type=str, help='model configuration', r
 args = parser.parse_args()
 cfg = build_cfg(args)
 
-model = CTCClassifier(cfg)
+extractor_net = ExtractorNetwork(cfg)
+task_net = TaskSpecificNetwork(cfg)
 
 train_ds, valid_ds = get_dataset(cfg, mode='train')
 
@@ -99,7 +102,8 @@ for epoch in range(cfg.epoch):
     if valid_loss.result() < best_valid_loss:
         best_valid_loss = valid_loss.result()
         best_valid_epoch = epoch + 1
-        model.save_weights(cfg.model_dir)
+        extractor_net.save_weights(cfg.model_dir + '.extract')
+        task_net.save_weights(cfg.model_dir + '.task')
     elif (epoch + 1) - best_valid_epoch > cfg.patience:
         break
 

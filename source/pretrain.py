@@ -2,13 +2,16 @@ import os
 import argparse
 from ezconfigparser import Config
 from data.loader import get_dataset
-from model.model import CTCClassifier
+from model.model import ExtractorNetwork, ContextNetwork
 import tensorflow as tf
 
 # --- hard-coded parameters --- #
 
 TEMPLATE_DATA_CFG = os.path.join(os.path.dirname(__file__), 'cfg', 'gen_data.cfg')
 TEMPLATE_MODEL_CFG = os.path.join(os.path.dirname(__file__), 'cfg', 'model.cfg')
+VIEW_SIZE = 6
+PRED_SIZE = 4
+NEG_RATIO = 10
 
 # --------- functions --------- #
 
@@ -20,30 +23,74 @@ def build_cfg(args):
     data_cfg.merge(model_cfg)
     return data_cfg
 
-def calc_logit_length(cfg):
+def calc_feat_length(cfg):
     length = (160 - cfg.kernel_size) // 2 + 1
-    length = (length - cfg.kernel_size) // 2 + 1
     length = (length - cfg.kernel_size) // 2 + 1
     return length
 
 @tf.function
 def train_step(img, label, label_length):
     with tf.GradientTape() as tape:
-        logit = model(img, training=True)
-        _logit_length = tf.ones([img.shape[0]], dtype=tf.int32) * logit_len
-        loss = loss_fn(label, logit, label_length, _logit_length, logits_time_major=False)
-        loss = tf.reduce_mean(loss)
-    gradients = tape.gradient(loss, model.trainable_variables)
-    optimizer.apply_gradients(zip(gradients, model.trainable_variables))
+        feat = extractor_net(img, training=True)
+        context = tf.signal.frame(feat, VIEW_SIZE, 1, axis=1) # [B, T, VIEW_SIZE, D]
+        context = tf.reshape(context, [context.shape[0], context.shape[1], -1]) # [B, T, VIEW_SIZE * D]
+        pred = context_net(context[:, :-1, :])
+
+        # Get Positive Latent Feature
+        pos_context = []
+        for indx in range(PRED_SIZE):
+            pos_context.append(feat[:, VIEW_SIZE + 1 + indx: feat_len - PRED_SIZE + indx + 1, :])
+        
+        loss = 0.
+        for indx in range(PRED_SIZE):
+            loss -= tf.math.log(tf.nn.sigmoid(tf.reduce_sum(tf.math.multiply(pos_context[indx], pred[indx]), axis=2)) + 1e-6)
+
+        # Get Negative Latent Feature
+        batch_shift = tf.random.uniform([NEG_RATIO], 1, img.shape[0] - 1, dtype=tf.int32)
+        time_shift = tf.random.uniform([NEG_RATIO], 1, feat_len - PRED_SIZE - VIEW_SIZE - 1, dtype=tf.int32)
+        
+        for indx in range(PRED_SIZE):
+            shifted = tf.roll(pos_context[indx], batch_shift[indx], axis=0)
+            shifted = tf.roll(shifted, time_shift[indx], axis=1)
+            loss -= 1 / PRED_SIZE * tf.math.log(tf.nn.sigmoid(- tf.reduce_sum(tf.math.multiply(shifted, pred[indx]), axis=2)) + 1e-6)
+        
+        loss = tf.reduce_mean(loss, axis=1)
+
+    gradients = tape.gradient(loss, extractor_net.trainable_variables + context_net.trainable_variables)
+    optimizer.apply_gradients(zip(gradients, extractor_net.trainable_variables + context_net.trainable_variables))
     train_loss(loss)
 
 
 @tf.function
 def valid_step(img, label, label_length):
-    logit = model(img, training=False)
-    _logit_length = tf.ones([img.shape[0]], dtype=tf.int32) * logit_len
-    loss = loss_fn(label, logit, label_length, _logit_length, logits_time_major=False)
+    
+    feat = extractor_net(img, training=False)
+    context = tf.signal.frame(feat, VIEW_SIZE, 1, axis=1) # [B, T, VIEW_SIZE, D]
+    context = tf.reshape(context, [context.shape[0], context.shape[1], -1]) # [B, T, VIEW_SIZE * D]
+    pred = context_net(context[:, :-1, :])
+
+    # Get Positive Latent Feature
+    pos_feat = []
+    for indx in range(PRED_SIZE):
+        pos_feat.append(feat[:, VIEW_SIZE + 1 + indx: feat_len - PRED_SIZE + indx + 1, :])
+    
+    loss = 0.
+    for indx in range(PRED_SIZE):
+        loss -= tf.math.log(tf.nn.sigmoid(tf.reduce_sum(tf.math.multiply(pos_feat[indx], pred[indx]), axis=2)) + 1e-6)
+
+    # Get Negative Latent Feature
+    batch_shift = tf.random.uniform([NEG_RATIO], 1, img.shape[0] - 1, dtype=tf.int32)
+    time_shift = tf.random.uniform([NEG_RATIO], 1, feat_len - PRED_SIZE - VIEW_SIZE - 1, dtype=tf.int32)
+    
+    for indx in range(PRED_SIZE):
+        shifted = tf.roll(pos_feat[indx], batch_shift[indx], axis=0)
+        shifted = tf.roll(shifted, time_shift[indx], axis=1)
+        loss += 1 / PRED_SIZE * tf.math.log(tf.nn.sigmoid(tf.reduce_sum(tf.math.multiply(shifted, pred[indx]), axis=2)) + 1e-6)
+    
+    loss = tf.reduce_mean(loss, axis=1)
     valid_loss(loss)
+
+    return feat
 
 
 @tf.function
@@ -61,17 +108,17 @@ parser.add_argument('-m', '--model_cfg', type=str, help='model configuration', r
 args = parser.parse_args()
 cfg = build_cfg(args)
 
-model = CTCClassifier(cfg)
+feat_len = calc_feat_length(cfg)
+
+extractor_net = ExtractorNetwork(cfg)
+context_net = ContextNetwork(cfg, PRED_SIZE)
 
 train_ds, valid_ds = get_dataset(cfg, mode='train')
 
 optimizer = tf.keras.optimizers.RMSprop(cfg.learning_rate)
-loss_fn = tf.nn.ctc_loss
 
 valid_loss = tf.keras.metrics.Mean(name='valid_loss')
 train_loss = tf.keras.metrics.Mean(name='train_loss')
-
-logit_len = calc_logit_length(cfg)
 
 total_step = '?'
 best_valid_loss = 1e10
@@ -91,15 +138,16 @@ for epoch in range(cfg.epoch):
     print(f'Epoch {epoch + 1}, '
         f'Step {step} / {total_step}, '
         f'Loss: {train_loss.result():.6f}')
-    
+
     for data in valid_ds:
-        valid_step(data[0], data[1], data[2])
+        _ = valid_step(data[0], data[1], data[2])
     print(f'Epoch {epoch + 1}, Validation Loss: {valid_loss.result():.6f}')
 
     if valid_loss.result() < best_valid_loss:
         best_valid_loss = valid_loss.result()
         best_valid_epoch = epoch + 1
-        model.save_weights(cfg.model_dir)
+        extractor_net.save_weights(cfg.model_dir + '.extract')
+        context_net.save_weights(cfg.model_dir + '.context')
     elif (epoch + 1) - best_valid_epoch > cfg.patience:
         break
 
